@@ -83,6 +83,17 @@ PA_MODULE_USAGE(
 #define MEMBLOCKQ_MAXLENGTH (16*1024*1024)
 #define DEFAULT_AUTOLOADED false
 
+#define ADV_WINDOWING
+#define SYNTH_WINDOW
+#define KBD_A4_30DB_WIDTH 3
+/*#define KBD_A6_30DB_WIDTH 3
+#define KBD_A6_40DB_WIDTH 5
+#define KBD_A6_60DB_WIDTH 13
+#define KBD_A6_90DB_WIDTH 17*/
+unsigned debug_i  = 0;
+unsigned debug_en = 0;
+struct damping;
+
 struct userdata {
     pa_module *module;
     pa_sink *sink;
@@ -127,6 +138,8 @@ struct userdata {
     char **base_profiles;
 
     bool automatic_description;
+    pa_aupdate** a_damping;
+    struct damping*** damping;
 };
 
 static const char* const valid_modargs[] = {
@@ -153,11 +166,99 @@ static const char* const valid_modargs[] = {
 static void dbus_init(struct userdata *u);
 static void dbus_done(struct userdata *u);
 
+/*
+static bool isCola(float *W, size_t window_size, size_t R) {
+  float* sum = malloc(window_size * 20);
+  memset(sum, 0, window_size*20);
+
+  for(unsigned i=0;i<3*window_size;i+=R) {
+    for(unsigned j=0;j<window_size;j++) {
+      sum[i+j]+=W[j];
+    }
+  }
+
+  for(unsigned i=window_size; i<3*window_size; i++){
+    if(!(sum[i]<=1+0.00001 && sum[i]>=1-0.00001)) {
+      pa_log_debug("is not COLA wSize %zu R %zu", window_size, R);
+      pa_assert(false);
+      free(sum);
+      return false;
+    }
+  }
+
+  free(sum);
+  return true;
+}
+*/
+
 static void hanning_window(float *W, size_t window_size) {
     /* h=.5*(1-cos(2*pi*j/(window_size+1)), COLA for R=(M+1)/2 */
     for (size_t i = 0; i < window_size; ++i)
-        W[i] = (float).5 * (1 - cos(2*M_PI*i / (window_size+1)));
+        W[i] = (float).5 * (1 - cos(2*M_PI*(i/*+0.5f*/) / (window_size)));
+    /*isCola(W, window_size, (window_size + 1) / 2);*/
 }
+
+
+
+#define BESSEL_I0_ITER 50 // default: 50 iterations of Bessel I0 approximation
+#define FF_KBD_WINDOW_MAX 1024*32
+static void ff_kbd_window_init(float *window, float alpha, int n)
+{
+   int i, j;
+   double sum = 0.0, bessel, tmp;
+   double local_window[FF_KBD_WINDOW_MAX];
+   double alpha2 = (alpha * M_PI / n) * (alpha * M_PI / n);
+
+   pa_assert(n <= FF_KBD_WINDOW_MAX);
+
+   for (i = 0; i < n; i++) {
+       tmp = i * (n - i) * alpha2;
+       bessel = 1.0;
+       for (j = BESSEL_I0_ITER; j > 0; j--)
+           bessel = bessel * tmp / (j * j) + 1;
+       sum += bessel;
+       local_window[i] = sum;
+   }
+
+   sum++;
+   for (i = 0; i < n; i++)
+       window[i] = sqrt(local_window[i] / sum);
+}
+
+static void kbd_window(float *W, size_t window_size) {
+  size_t wSizeBy2 = window_size/2;
+  pa_assert(window_size%2==0);
+  ff_kbd_window_init(W, 4, wSizeBy2);
+  for (size_t i = 0; i < wSizeBy2; i++)
+      W[wSizeBy2 + i] = W[wSizeBy2-1 - i];
+}
+
+/*
+ static void mltsine_window(float *W, size_t window_size) {
+     for (size_t i = 0; i < window_size; ++i) {
+         W[i] = (sin((i+1/2.0f) * M_PI / (window_size)));
+     }
+ }
+
+static void hamming_window(float *W, size_t window_size) {
+    for (size_t i = 0; i < window_size; ++i) {
+        W[i] = 0.54 - 0.46*cos(2*M_PI*i/window_size);
+    }
+    //isCola(W, window_size, (window_size + 1) / 2);
+}
+//80%overlap
+static void hft95_window(float *W, size_t window_size) {
+  for (size_t i = 0; i < window_size; ++i) {
+    W[i] = 1 - 1.9383379 * cos(2*M_PI*i/window_size) + 1.3045202 * cos(2*2*M_PI*i/window_size) - 0.4028270 * cos(3*2*M_PI*i/window_size) + 0.0350665 * cos(4*2*M_PI*i/window_size);
+  }
+}
+
+static void nutall4_window(float *W, size_t window_size) {
+  for (size_t i = 0; i < window_size; ++i) {
+    W[i] = 0.3125 - 0.46875 * cos(2*M_PI*i/window_size) + 0.1875 * cos(2*2*M_PI*i/window_size) - 0.03125 * cos(3*2*M_PI*i/window_size);
+  }
+}
+*/
 
 static void fix_filter(float *H, size_t fft_size) {
     /* divide out the fft gain */
@@ -236,6 +337,519 @@ static void alloc_input_buffers(struct userdata *u, size_t min_buffer_length) {
     }
     u->input_buffer_max = min_buffer_length;
 }
+
+/*
+ * call init_geo_series()
+ * data is not protected - do not put more than SERIES_DATA_LEN elements
+*/
+struct geo_series {
+  #define SERIES_DATA_LEN 1024
+  float   data[SERIES_DATA_LEN];
+  float*  head;
+  float*  tail;
+  float   sum;
+  float   ratio;
+  float   end_ratio; /* pow(ratio, seriesLen) */
+};
+#define SERIES_DATA_END(q) ((q)->data + SERIES_DATA_LEN)
+
+/* a_i = val_i * ratio ^ i; sum = a_0 + a_1 + ... = val_0 + val_1*ratio + val_2*ratio^2 ... */
+static void cycle(struct geo_series* q, float val) {//TODO zero ratio shall mean no signal mod
+  /*pop*/
+  pa_assert((q->data-q->head)<SERIES_DATA_LEN);
+  pa_assert((q->data-q->tail)<SERIES_DATA_LEN);
+  q->sum -= *q->head * q->end_ratio;
+  ++q->head;
+  if (q->head == SERIES_DATA_END(q)) {
+      q->head = q->data;
+  }
+
+  q->sum *= q->ratio;
+
+  /*push*/
+  *q->tail = val;
+  q->sum += *q->tail;
+  ++q->tail;
+  if (q->tail == SERIES_DATA_END(q)) {
+    q->tail = q->data;
+  }
+}
+
+static void init_geo_series(struct geo_series* q, const float ratio) {
+  const uint32_t len = SERIES_DATA_LEN-1;
+  for (unsigned i = 0; i < sizeof(q->data)/sizeof(q->data[0]); i++) {
+    q->data[i] = 0.0f;
+  }
+  q->head = q->data;
+  q->tail = q->data + len;
+  q->sum = 0;
+  q->ratio = ratio;
+  q->end_ratio = pow(ratio, len-1);
+}
+
+/*
+ * call init_damping()
+ * create filters by calling add_damping_plan
+ * apply_filter() on data
+*/
+struct damping {
+  size_t H_size;
+  float* H; //filter, used in dsp_logic()
+  size_t fftLen; //max of planHead->fftLen
+  fftwf_complex* output_window;
+  float* work_buffer;
+  float* restrict delayBuff;
+  struct damping_plan* planHead;
+};
+
+static void init_damping( struct damping* damping, size_t filterSize) {
+  memset(damping, 0, sizeof(struct damping));
+  damping->H_size = filterSize;
+  damping->H = alloc(filterSize, sizeof(float));
+  for (unsigned i = 0; i < filterSize; i++) {
+    damping->H[i] = 0.0f;
+  }
+}
+
+struct acu_params {
+  uint32_t filterId;
+  uint32_t fftBin; //y=dft(signal), y[fftBin]. It is frequency. freq = fftBin * samplingRate/fftLen
+  uint32_t fftBinStart;
+  uint32_t fftBinEnd;
+  float    seriesRatio;
+  float    maxCorrection;
+};
+
+struct frequency_acumulator {
+  struct acu_params acuParams;
+  struct geo_series acumulator;
+};
+
+static void init_frequency_acumulator(struct frequency_acumulator* freq_acu, const struct acu_params* acuParams) {
+  freq_acu->acuParams = *acuParams;
+  init_geo_series(&freq_acu->acumulator, acuParams->seriesRatio);
+}
+
+struct plan_params {
+  size_t fftLen;
+  size_t windowSize;
+  size_t R;
+  size_t overlapSize;
+#ifdef ADV_WINDOWING
+  size_t preProcBuffersNum;
+#endif
+};
+
+
+struct damping_plan {
+  struct plan_params planParams;
+  float* restrict W;//windowing function (time domain)
+  float* restrict overlapBuffer;
+  float* restrict outputBuffer;
+  fftwf_plan forward_plan, inverse_plan;
+  #define FREQ_ACU_SIZE 8
+  size_t freq_acu_len;
+  struct frequency_acumulator freq_acu[FREQ_ACU_SIZE];
+  struct damping_plan* next;
+
+#ifdef ADV_WINDOWING
+  size_t preProcBuffPos;
+  size_t emptyBuff;
+  size_t firstReusableBuffIdx;
+  size_t reusableBuffSample;
+  float** restrict preProcBuff;
+#endif
+};
+
+static void build_damping_plan_window_params(struct plan_params* planParams, const uint32_t ssRate, const size_t uR, const uint32_t resolutionHz) {
+#ifndef ADV_WINDOWING
+  pa_assert(uR>0 && !(uR&(uR-1))); //uR == 2^x
+  planParams->R = ssRate / (double)resolutionHz + 0.5;
+  planParams->R = pow(2, floor(logf(planParams->R)/log(2)));
+  planParams->windowSize = planParams->R*2;
+  planParams->overlapSize = planParams->windowSize - planParams->R;
+  pa_assert(uR%(planParams->R)==0);
+#else
+  planParams->windowSize = ssRate / (double)resolutionHz + 0.5;
+  planParams->windowSize = planParams->windowSize & (planParams->windowSize-1);
+  planParams->R = planParams->windowSize/2;
+  planParams->overlapSize = planParams->windowSize - planParams->R;
+#endif
+  pa_assert(planParams->windowSize<=planParams->fftLen);
+}
+
+static void build_damping_plan_params(struct plan_params* planParams, struct acu_params* acuParams, const uint32_t filterId,
+                                      const uint32_t freq, const float seriesRatio, const float maxCorrection,
+                                      const uint32_t resolutionHz, const uint32_t filterWidth, struct userdata* u) {
+  const uint32_t ssRate = u->sink_input->sample_spec.rate;
+  planParams->fftLen = ssRate / (double)(resolutionHz) + 0.5;
+  //*fftLen = u->R / (u->R/ (double)(*fftLen)) + 0.5; //u->R % fftLen == 0
+  planParams->fftLen = pow(2, ceil(logf(planParams->fftLen)/log(2)));//ceil(fftLen) to nearest 2^n
+
+  build_damping_plan_window_params(planParams, ssRate, u->R, resolutionHz);//
+
+  acuParams->filterId      = filterId;
+  acuParams->fftBin        = (freq*(planParams->fftLen)/(double)(ssRate)) + 0.5;
+  if (acuParams->fftBin >= filterWidth/2)
+    acuParams->fftBinStart = acuParams->fftBin-filterWidth/2;
+  else
+    acuParams->fftBinStart = 0;
+  acuParams->fftBinEnd     = acuParams->fftBin+filterWidth/2;
+  if (acuParams->fftBinEnd > (planParams->fftLen/2))
+    acuParams->fftBinEnd   = (planParams->fftLen/2);
+  acuParams->seriesRatio   = seriesRatio;
+  acuParams->maxCorrection = maxCorrection;
+#ifdef ADV_WINDOWING
+  planParams->preProcBuffersNum = ceil(((u->R+((planParams->windowSize-planParams->R)))-1)/(float)(planParams->R)) + 1; //how many R will fit in baseR+windowSize-R expectedFullProcessedSamples
+#endif
+}
+
+static void init_damping_plan(struct damping_plan* plan, const struct plan_params* planParams) {
+  plan->planParams = *planParams;
+
+  plan->W = alloc(planParams->windowSize, sizeof(float));
+//#ifdef SYNTH_WINDOW
+  kbd_window(plan->W, planParams->windowSize);
+  plan->overlapBuffer = alloc(planParams->overlapSize, sizeof(float));
+  memset(plan->overlapBuffer, 0, planParams->overlapSize*sizeof(float));
+  plan->outputBuffer = alloc(50000, sizeof(float)); //TODO expectedFullProcessedSamples+plan->windowSize-plan->R
+
+  plan->freq_acu_len = 0;
+  /*struct acu_params acuParams = {};
+  init_frequency_acumulator(&(plan->freq_acu), &acuParams);
+*/
+
+  plan->next = NULL;
+}
+
+static void init_damping_plan_adv(struct damping_plan* plan, const struct plan_params* planParams) {
+  init_damping_plan(plan, planParams);
+#ifdef ADV_WINDOWING
+  plan->preProcBuffPos = 0;//preProcBuff possition in relation to baseR
+  plan->emptyBuff = 0;//start filling from preProcBuff[0]
+  plan->firstReusableBuffIdx = 0; //0 - at first mixing iteration preProcBuff[0] shall be used
+  plan->reusableBuffSample = 0;//0 - at first mixing iteration mixing starts form sample 0 in preProcBuff[0]
+  //plan->preProcBuffersNum = preProcBuffersNum; //done in init_damping_plan()
+  plan->preProcBuff = pa_xnew0(float*, plan->planParams.preProcBuffersNum);
+  for (unsigned i = 0; i < plan->planParams.preProcBuffersNum; i++) {
+    plan->preProcBuff[i] = alloc(plan->planParams.fftLen, sizeof(float));
+  }
+#endif
+}
+
+static void free_damping_plan(struct damping_plan** plan) {
+  fftwf_destroy_plan((*plan)->forward_plan);
+  fftwf_destroy_plan((*plan)->inverse_plan);
+  fftwf_free((*plan)->W);
+  fftwf_free((*plan)->overlapBuffer);
+  fftwf_free((*plan)->outputBuffer);
+#ifdef ADV_WINDOWING
+  for (unsigned i = 0; i < (*plan)->planParams.preProcBuffersNum; i++) {
+    fftwf_free((*plan)->preProcBuff[i]);
+  }
+  pa_xfree((*plan)->preProcBuff);
+#endif
+
+  free(*plan);
+  *plan = NULL;
+}
+
+/*find plan by fftLen, if not found return last one*/
+static bool find_plan_fft(struct damping_plan** plan, struct damping* damping, const size_t fftLen) { //TODO swith to windowSize instead of fftLen
+  struct damping_plan* plan_prev;
+  *plan = damping->planHead;
+  while(NULL != *plan) {
+    if ((*plan)->planParams.fftLen == fftLen)
+      return true;
+    plan_prev = *plan;
+    (*plan) = (*plan)->next;
+  }
+  (*plan) = plan_prev;
+  return false;
+}
+
+static void remove_filter_id(struct damping* damping, uint32_t filterId) {
+  struct damping_plan* plan_cur = damping->planHead;
+
+  while (NULL != plan_cur) {
+    for(size_t i = 0; i<plan_cur->freq_acu_len; i++) {
+      if (plan_cur->freq_acu[i].acuParams.filterId == filterId) {
+        struct frequency_acumulator* dst_acu = plan_cur->freq_acu;
+        struct frequency_acumulator* end_acu = plan_cur->freq_acu + plan_cur->freq_acu_len;
+        for(struct frequency_acumulator* acu = plan_cur->freq_acu; acu != end_acu; acu++) {
+          if (acu->acuParams.filterId != filterId) {
+            *(dst_acu++) = *acu;
+          }
+          else {
+            plan_cur->freq_acu_len--;
+          }
+        }
+        return;
+      }
+    }
+    plan_cur = plan_cur->next;
+  }
+}
+
+typedef void(*for_each_cb)(struct damping*, struct damping_plan*, struct damping_plan*);
+static void for_each_plan(struct damping* damping, for_each_cb callback) {
+  struct damping_plan* plan_cur  = damping->planHead;
+  struct damping_plan* plan_prev = NULL;
+  while (NULL != plan_cur) {
+    callback(damping, plan_prev, plan_cur);
+    plan_prev = plan_cur;
+    plan_cur  = plan_cur->next;
+  }
+}
+
+static void print_plan(struct damping* damping, struct damping_plan* plan_prev, struct damping_plan* plan_cur) {
+  struct plan_params* plan_params = &plan_cur->planParams;
+  for(size_t i = 0; i<plan_cur->freq_acu_len; i++) {
+    pa_log_debug("id=%u, fftlen=%zu, fftBin=%u", plan_cur->freq_acu[i].acuParams.filterId, plan_params->fftLen, plan_cur->freq_acu[i].acuParams.fftBin);
+  }
+}
+
+/*remove dummy plans - plans with no acumulator*/
+static void remove_empty_plans(struct damping* damping) { //TODO sorting and expectedFullProcessedSamples
+  struct damping_plan* plan_cur  = damping->planHead;
+  struct damping_plan* plan_prev = NULL;
+
+  while (NULL != plan_cur) {
+    if (plan_cur->freq_acu_len == 0) {
+      if (NULL != plan_prev) {
+        plan_prev->next = plan_cur->next;
+        free_damping_plan(&plan_cur);
+        plan_cur = plan_prev->next;
+      }
+      else { /*first iteration*/
+        pa_assert(damping->planHead==plan_cur);
+        damping->planHead = plan_cur->next;
+        free_damping_plan(&plan_cur);
+        plan_cur = damping->planHead;
+      }
+    }
+    if (NULL == plan_cur)
+      break;
+    plan_prev = plan_cur;
+    plan_cur = plan_cur->next;
+  }
+}
+
+/*insert in descending fftLen order*/
+static void insert_plan(struct damping* damping, struct damping_plan* plan) {
+  struct damping_plan* plan_cur = NULL;
+  pa_assert(damping);
+  pa_assert(plan);
+  plan_cur = damping->planHead;
+  if (NULL == damping->planHead) {
+    damping->planHead = plan;
+    return;
+  }
+  if (plan->planParams.fftLen >= damping->planHead->planParams.fftLen) {
+    plan->next = damping->planHead;
+    damping->planHead = plan;
+    return;
+  }
+  while (NULL != plan_cur) {
+    if (plan->planParams.fftLen < plan_cur->planParams.fftLen) {
+      plan->next = plan_cur->next;
+      plan_cur->next = plan;
+      return;
+    }
+    plan_cur = plan_cur->next;
+  }
+}
+
+/*
+ * create new damping_plan, resize damping buffer if needed
+*/
+static struct damping_plan* make_damping_plan(struct damping* damping, const struct plan_params* planParams, const struct acu_params* acuParams) {
+  struct damping_plan* newPlan = malloc(sizeof(struct damping_plan));
+  init_damping_plan_adv(newPlan, planParams);
+
+  //buffers has to be resized if new fftLen > damping->fftLen
+  if (planParams->fftLen > damping->fftLen) {
+    pa_log_debug("buffers will be allocated: %zu -> %zu", damping->fftLen, planParams->fftLen);
+    fftwf_free(damping->output_window);
+    fftwf_free(damping->work_buffer);
+    damping->output_window  = alloc((planParams->fftLen / 2 + 1), sizeof(fftwf_complex));
+    damping->work_buffer    = alloc(planParams->fftLen, sizeof(float));
+    damping->delayBuff      = alloc(60000, sizeof(float));//TODO impl size baseR or sth.
+    damping->fftLen         = planParams->fftLen;
+  }
+
+  newPlan->forward_plan = fftwf_plan_dft_r2c_1d(planParams->fftLen, damping->work_buffer, damping->output_window, FFTW_MEASURE);
+  newPlan->inverse_plan = fftwf_plan_dft_c2r_1d(planParams->fftLen, damping->output_window, damping->work_buffer, FFTW_MEASURE);
+  if (newPlan->forward_plan != NULL && newPlan->inverse_plan != NULL) {
+    init_frequency_acumulator(newPlan->freq_acu, acuParams);
+    newPlan->freq_acu_len = 1;
+  }
+  else {
+    free_damping_plan(&newPlan);
+  }
+  return newPlan;
+}
+
+static bool add_damping_plan(struct damping* damping, const uint32_t filterId, const uint32_t freq, const float seriesRatio,
+                             const float maxCorrection, const uint32_t resolutionHz, const uint32_t filterWidth, struct userdata* u) {
+  struct plan_params planParams;
+  struct acu_params acuParams;
+  struct damping_plan* plan = damping->planHead;
+
+  build_damping_plan_params(&planParams, &acuParams, filterId, freq, seriesRatio, maxCorrection, resolutionHz, filterWidth, u);
+
+  /*remove filter (if exists) and then create acumulator in new plan or reuse existing plan*/
+  remove_filter_id(damping, acuParams.filterId);
+
+  if (true == find_plan_fft(&plan, damping, planParams.fftLen)) {
+      if (FREQ_ACU_SIZE > plan->freq_acu_len) {
+        init_frequency_acumulator(&plan->freq_acu[plan->freq_acu_len], &acuParams);
+        plan->freq_acu_len += 1;
+      }
+      else {
+        return false;
+      }
+  }
+  else {
+    struct damping_plan* newPlan = make_damping_plan(damping, &planParams, &acuParams);
+    insert_plan(damping, newPlan);
+  }
+  remove_empty_plans(damping);
+  return true;
+}
+
+static void damping_filter(struct damping* damping, struct damping_plan* plan) {
+  const float filterQ = 1.0f;
+  float dampingVal = 1.0f;
+  for(unsigned i = 0; i < plan->freq_acu_len; i++) {
+    struct geo_series* acumulator = &plan->freq_acu[i].acumulator;
+    float*        cplxVal    = damping->output_window[plan->freq_acu[i].acuParams.fftBin];
+    float*        real       = &cplxVal[0];
+    float*        img        = &cplxVal[1];
+    float         absVal     = sqrtf((*real)*(*real)+(*img)*(*img));
+    uint32_t      j          = 0;
+
+    /*float queueGeometricSumCorrection = 1 / ((plan->freq_acu[i].acuParams.seriesLen)*((1-powf(acuMulti, FREQUENCY_ACUMULATOR_ACUMULATOR_SIZE))/(1-acuMulti)));*/
+    float absDst = absVal - acumulator->sum*filterQ;
+    //pa_log_debug("absDst %f = absVal %f - sum %f", absDst, absVal, acumulator->sum);
+
+    dampingVal = absDst/absVal;
+    if (isnan(dampingVal))
+      dampingVal = 1.0f;
+    dampingVal = PA_CLAMP_UNLIKELY(dampingVal, plan->freq_acu[i].acuParams.maxCorrection, 2.0f);
+
+    for(j=plan->freq_acu[i].acuParams.fftBinStart; j<=plan->freq_acu[i].acuParams.fftBinEnd; j++) { //TODO make it variable
+      damping->output_window[j][0] *= dampingVal;
+      damping->output_window[j][1] *= dampingVal;
+    }
+
+    absDst = dampingVal * absVal;
+    //pa_log_debug("absDst %f, sum %f" , absDst, acumulator->sum);
+    cycle(acumulator, absDst);
+    //pa_log_debug("sum %f", acumulator->sum);
+  }//for over plan->acumulator
+}
+
+static void apply_filter(struct damping* damping, float* restrict src, const struct userdata* u) {
+  unsigned lastPreProcessedBuffIdx = 0;
+  unsigned mixingBuffIdx           = 0;
+  unsigned mixingMoveR             = 0;
+  int      mixingStartSample       = 0;
+
+  const size_t baseR = u->R;
+  struct damping_plan* plan = damping->planHead;
+
+  if (NULL != plan) { //TODO buffering
+    memmove(damping->delayBuff, damping->delayBuff + baseR, 2*baseR * sizeof(float));
+    memcpy(damping->delayBuff+2*baseR, src+baseR, baseR * sizeof(float));
+  }
+
+  while (NULL != plan) {
+    const unsigned expectedFullProcessedSamples = baseR;// + plan->R;//plan->windowSize - plan->R;
+    float absValNormalizer = 1 / (float)plan->planParams.fftLen / 2;
+    pa_assert(plan->planParams.fftLen >= plan->planParams.windowSize);
+
+    /*store parametrs from previous run, use them in mixer*/
+    mixingBuffIdx     = plan->firstReusableBuffIdx;
+    mixingStartSample = plan->reusableBuffSample;
+    plan->firstReusableBuffIdx = UINT32_MAX;
+
+    for(;;) {
+      for(size_t i = 0; i < plan->planParams.windowSize; ++i) {
+        plan->preProcBuff[plan->emptyBuff][i] = plan->W[i] * damping->delayBuff[i+baseR+(plan->preProcBuffPos)];
+      }
+      memset(plan->preProcBuff[plan->emptyBuff] + plan->planParams.windowSize, 0, (plan->planParams.fftLen - plan->planParams.windowSize) * sizeof(float));
+
+      fftwf_execute_dft_r2c(plan->forward_plan, plan->preProcBuff[plan->emptyBuff], damping->output_window);
+      damping_filter(damping, plan);
+      fftwf_execute_dft_c2r(plan->inverse_plan, damping->output_window, plan->preProcBuff[plan->emptyBuff]);
+
+      if (plan->firstReusableBuffIdx == UINT32_MAX) {
+        if (plan->preProcBuffPos + plan->planParams.windowSize > baseR) {
+          plan->firstReusableBuffIdx = plan->emptyBuff;
+          plan->reusableBuffSample = baseR - plan->preProcBuffPos;
+        }
+      }
+
+      plan->preProcBuffPos += plan->planParams.R;/*preProcBuffPos is now fullyProcessedSamples+1*/
+      if (plan->preProcBuffPos >= expectedFullProcessedSamples) {
+        plan->preProcBuffPos %= baseR;
+        break;
+      }
+      plan->emptyBuff++;
+      plan->emptyBuff %= plan->planParams.preProcBuffersNum;
+    }
+    lastPreProcessedBuffIdx = plan->emptyBuff;
+    plan->emptyBuff++;
+    plan->emptyBuff %= plan->planParams.preProcBuffersNum;
+
+    /*mixing*/
+    memset(plan->outputBuffer, 0, sizeof(float)*expectedFullProcessedSamples);//expectedFullProcessedSamples
+    mixingMoveR = 0;
+    for (;;) {
+      for(unsigned i = 0; i<plan->planParams.windowSize-mixingStartSample; i++) {
+#ifdef SYNTH_WINDOW
+        plan->outputBuffer[mixingMoveR + i] += plan->preProcBuff[mixingBuffIdx][mixingStartSample + i] * plan->W[mixingStartSample + i];
+#else
+        plan->outputBuffer[mixingMoveR + i] += plan->preProcBuff[mixingBuffIdx][mixingStartSample + i];
+#endif
+      }
+
+      mixingStartSample -= plan->planParams.R;
+      if (mixingStartSample <= 0) {
+        mixingMoveR -= mixingStartSample;//no plan->R , has to be as is
+        mixingStartSample = 0;
+      }
+
+      if (mixingMoveR >= expectedFullProcessedSamples/* || mixingBuffIdx == lastPreProcessedBuffIdx*/)
+        break;
+      pa_assert(mixingBuffIdx != lastPreProcessedBuffIdx);
+      mixingBuffIdx++;
+      mixingBuffIdx %= plan->planParams.preProcBuffersNum;
+    }
+    for (unsigned i=0; i<expectedFullProcessedSamples; i++) {
+      src[baseR+i] = plan->outputBuffer[i] * absValNormalizer;
+    }
+    plan = plan->next;
+  }
+  debug_i++;
+  debug_en= debug_i%32 == 0;
+}
+/*pa_log_debug("apply_filter src[%d] %f", i, src[0]);
+printf("\n\nbefore\n");
+for(unsigned i = 0; i<baseWindowSize+damping->fftLen;i+=2000) {
+  printf("s[%d]%.2f ", i, src[i]);
+}*/
+
+/*
+        static unsigned debugCounter=1;
+        for(unsigned j=0;j<debugCounter; j++) {
+          plan->preProcBuff[plan->emptyBuff][j+20]=30/absValNormalizer;
+          plan->preProcBuff[plan->emptyBuff][plan->planParams.R+j]=1/absValNormalizer;
+          plan->preProcBuff[plan->emptyBuff][plan->planParams.windowSize-1-debugCounter+j-30]=10/absValNormalizer;
+        }
+        debugCounter++;
+*/
 
 /* Called from I/O thread context */
 static int sink_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
@@ -393,6 +1007,10 @@ static void dsp_logic(
         u->output_window[j][0] *= H[j];
         u->output_window[j][1] *= H[j];
     }
+    /*u->output_window[(unsigned)(800 * pow(2,16)/48000)][0] *= 0.0;
+    u->output_window[(unsigned)(800 * pow(2,16)/48000)][1] *= 0.0;*/
+    //pa_log_debug("dsp_logic damping->H %f", u->damping->H[]);
+
     //inverse fft
     fftwf_execute_dft_c2r(u->inverse_plan, output_window, dst);
     ////debug: tests overlapping add
@@ -404,7 +1022,7 @@ static void dsp_logic(
 
     //overlap add and preserve overlap component from this window (linear phase)
     for(size_t j = 0; j < u->overlap_size; ++j) {
-        u->work_buffer[j] += overlap[j];
+        dst[j] += overlap[j];
         overlap[j] = dst[u->R + j];
     }
     ////debug: tests if basic buffering works
@@ -538,7 +1156,7 @@ static void flatten_to_memblockq(struct userdata *u) {
 
 static void process_samples(struct userdata *u) {
     size_t fs = pa_frame_size(&(u->sink->sample_spec));
-    unsigned a_i;
+    unsigned a_i, a_damping_i;
     float *H, X;
     size_t iterations, offset;
     pa_assert(u->samples_gathered >= u->window_size);
@@ -557,6 +1175,10 @@ static void process_samples(struct userdata *u) {
             a_i = pa_aupdate_read_begin(u->a_H[c]);
             X = u->Xs[c][a_i];
             H = u->Hs[c][a_i];
+
+            a_damping_i = pa_aupdate_read_begin(u->a_damping[c]);
+            apply_filter(u->damping[c][a_damping_i], u->input[c], u);
+            pa_aupdate_read_end(u->a_damping[c]);
             dsp_logic(
                 u->work_buffer,
                 u->input[c],
@@ -1152,8 +1774,8 @@ int pa__init(pa_module*m) {
     u->channels = ss.channels;
     u->fft_size = pow(2, ceil(log(ss.rate) / log(2)));//probably unstable near corner cases of powers of 2
     pa_log_debug("fft size: %zd", u->fft_size);
-    u->window_size = 15999;
-    if (u->window_size % 2 == 0)
+    u->window_size = u->fft_size/4; //250ms window looks reasonable
+    if (u->window_size % 2 != 0)
         u->window_size--;
     u->R = (u->window_size + 1) / 2;
     u->overlap_size = u->window_size - u->R;
@@ -1305,6 +1927,19 @@ int pa__init(pa_module*m) {
         pa_aupdate_write_end(u->a_H[c]);
     }
 
+    u->damping = pa_xnew0(struct damping**, u->channels);
+    u->a_damping = pa_xnew0(pa_aupdate*, u->channels);
+
+    for (c = 0; c < u->channels; ++c) {
+      u->a_damping[c] = pa_aupdate_new();
+      u->damping[c]   = pa_xnew0(struct damping*, 2);
+      for (i = 0; i < 2; ++i) {
+        u->damping[c][i] = pa_xnew0(struct damping, 1);
+        init_damping(u->damping[c][i], FILTER_SIZE(u));
+      }
+    }
+
+
     /* load old parameters */
     load_state(u);
 
@@ -1419,6 +2054,8 @@ static void equalizer_get_n_coefs(DBusConnection *conn, DBusMessage *msg, void *
 static void equalizer_get_n_channels(DBusConnection *conn, DBusMessage *msg, void *_u);
 static void equalizer_get_all(DBusConnection *conn, DBusMessage *msg, void *_u);
 static void equalizer_handle_seed_filter(DBusConnection *conn, DBusMessage *msg, void *_u);
+static void equalizer_handle_seed_damping_filter(DBusConnection *conn, DBusMessage *msg, void *_u);
+static void equalizer_handle_remove_damping_filter(DBusConnection *conn, DBusMessage *msg, void *_u);
 static void equalizer_handle_get_filter_points(DBusConnection *conn, DBusMessage *msg, void *_u);
 static void equalizer_handle_get_filter(DBusConnection *conn, DBusMessage *msg, void *_u);
 static void equalizer_handle_set_filter(DBusConnection *conn, DBusMessage *msg, void *_u);
@@ -1487,6 +2124,8 @@ static pa_dbus_interface_info manager_info={
 enum equalizer_method_index {
     EQUALIZER_METHOD_FILTER_POINTS,
     EQUALIZER_METHOD_SEED_FILTER,
+    EQUALIZER_METHOD_SEED_DUMPING_FILTER,
+    EQUALIZER_METHOD_REMOVE_DUMPING_FILTER,
     EQUALIZER_METHOD_SAVE_PROFILE,
     EQUALIZER_METHOD_LOAD_PROFILE,
     EQUALIZER_METHOD_SET_FILTER,
@@ -1516,6 +2155,16 @@ pa_dbus_arg_info seed_filter_args[]={
     {"xs", "au","in"},
     {"ys", "ad","in"},
     {"preamp", "d","in"}
+};
+pa_dbus_arg_info seed_damping_filter_args[]={
+    {"id", "u","in"},
+    {"freq", "u","in"},
+    {"ratio", "d","in"},
+    {"resolution", "u","in"},
+    {"filter_width", "u","in"}
+};
+pa_dbus_arg_info remove_damping_filter_args[]={
+    {"id", "u","in"}
 };
 
 pa_dbus_arg_info set_filter_args[]={
@@ -1548,6 +2197,16 @@ static pa_dbus_method_handler equalizer_methods[EQUALIZER_METHOD_MAX]={
         .arguments=seed_filter_args,
         .n_arguments=sizeof(seed_filter_args)/sizeof(pa_dbus_arg_info),
         .receive_cb=equalizer_handle_seed_filter},
+    [EQUALIZER_METHOD_SEED_DUMPING_FILTER]={
+        .method_name="SeedDampingFilter",
+        .arguments=seed_damping_filter_args,
+        .n_arguments=sizeof(seed_damping_filter_args)/sizeof(pa_dbus_arg_info),
+        .receive_cb=equalizer_handle_seed_damping_filter},
+    [EQUALIZER_METHOD_REMOVE_DUMPING_FILTER]={
+        .method_name="RemoveDampingFilter",
+        .arguments=remove_damping_filter_args,
+        .n_arguments=sizeof(remove_damping_filter_args)/sizeof(pa_dbus_arg_info),
+        .receive_cb=equalizer_handle_remove_damping_filter},
     [EQUALIZER_METHOD_FILTER_POINTS]={
         .method_name="FilterAtPoints",
         .arguments=filter_points_args,
@@ -1840,6 +2499,10 @@ void equalizer_handle_seed_filter(DBusConnection *conn, DBusMessage *msg, void *
                 DBUS_TYPE_ARRAY, DBUS_TYPE_UINT32, &xs, &x_npoints,
                 DBUS_TYPE_ARRAY, DBUS_TYPE_DOUBLE, &_ys, &y_npoints,
                 DBUS_TYPE_DOUBLE, &preamp,
+//                DBUS_TYPE_ARRAY, DBUS_TYPE_DOUBLE, &_damping, &damping_npoints,//damping amount/ filter Q number
+//                DBUS_TYPE_ARRAY, DBUS_TYPE_UINT32, &_damping_frequencies, &damping_frequencies_npoints,//central frequency
+//                DBUS_TYPE_ARRAY, DBUS_TYPE_UINT32, &_damping_mvavg_size, &damping_mvavg_npoints,//mavg base size (response by half)
+//                DBUS_TYPE_ARRAY, DBUS_TYPE_UINT32, &_damping_fft_size, &damping_fftsize_npoints,//fft size - frequency resolutiuon, trade it with moving avg size
                 DBUS_TYPE_INVALID)) {
         pa_dbus_send_error(conn, msg, DBUS_ERROR_INVALID_ARGS, "%s", error.message);
         dbus_error_free(&error);
@@ -1897,6 +2560,79 @@ void equalizer_handle_seed_filter(DBusConnection *conn, DBusMessage *msg, void *
     pa_assert_se((message = dbus_message_new_signal(u->dbus_path, EQUALIZER_IFACE, equalizer_signals[EQUALIZER_SIGNAL_FILTER_CHANGED].name)));
     pa_dbus_protocol_send_signal(u->dbus_protocol, message);
     dbus_message_unref(message);
+}
+
+void equalizer_handle_seed_damping_filter(DBusConnection *conn, DBusMessage *msg, void *_u) {
+    struct userdata *u = _u;
+    DBusError error;
+    //DBusMessage *message = NULL;
+    uint32_t channel, filter_id, freq, resolution, filter_width, a_damping_i;
+    double ratio;
+
+    pa_assert(conn);
+    pa_assert(msg);
+    pa_assert(u);
+
+    dbus_error_init(&error);
+
+    if (!dbus_message_get_args(msg, &error,
+                DBUS_TYPE_UINT32, &filter_id,
+                DBUS_TYPE_UINT32, &freq,
+                DBUS_TYPE_DOUBLE, &ratio,
+                DBUS_TYPE_UINT32, &resolution,
+                DBUS_TYPE_UINT32, &filter_width,
+                DBUS_TYPE_INVALID)) {
+        pa_dbus_send_error(conn, msg, DBUS_ERROR_INVALID_ARGS, "%s", error.message);
+        dbus_error_free(&error);
+        return;
+    }
+
+    for(channel = 0; channel < u->channels; channel++) {
+      a_damping_i = pa_aupdate_write_begin(u->a_damping[channel]);
+      add_damping_plan(u->damping[channel][a_damping_i], filter_id, freq, ratio, 0.0, resolution, filter_width, u);
+      a_damping_i = pa_aupdate_write_swap(u->a_damping[channel]);
+      add_damping_plan(u->damping[channel][a_damping_i], filter_id, freq, ratio, 0.0, resolution, filter_width, u);
+      pa_aupdate_write_end(u->a_damping[channel]);
+    }
+    for_each_plan(u->damping[0][0], print_plan);
+
+    pa_dbus_send_empty_reply(conn, msg);
+
+/*    pa_assert_se((message = dbus_message_new_signal(u->dbus_path, EQUALIZER_IFACE, equalizer_signals[EQUALIZER_SIGNAL_FILTER_CHANGED].name)));
+    pa_dbus_protocol_send_signal(u->dbus_protocol, message);
+    dbus_message_unref(message);
+    */
+}
+
+void equalizer_handle_remove_damping_filter(DBusConnection *conn, DBusMessage *msg, void *_u) {
+    struct userdata *u = _u;
+    DBusError error;
+    uint32_t filter_id, channel, a_damping_i;
+
+    pa_assert(conn);
+    pa_assert(msg);
+    pa_assert(u);
+
+    dbus_error_init(&error);
+
+    if (!dbus_message_get_args(msg, &error,
+                DBUS_TYPE_UINT32, &filter_id,
+                DBUS_TYPE_INVALID)) {
+        pa_dbus_send_error(conn, msg, DBUS_ERROR_INVALID_ARGS, "%s", error.message);
+        dbus_error_free(&error);
+        return;
+    }
+
+    for(channel = 0; channel < u->channels; channel++) {
+      a_damping_i = pa_aupdate_write_begin(u->a_damping[channel]);
+      remove_filter_id(u->damping[channel][a_damping_i], filter_id);
+      a_damping_i = pa_aupdate_write_swap(u->a_damping[channel]);
+      remove_filter_id(u->damping[channel][a_damping_i], filter_id);
+      pa_aupdate_write_end(u->a_damping[channel]);
+    }
+    for_each_plan(u->damping[0][0], print_plan);
+
+    pa_dbus_send_empty_reply(conn, msg);
 }
 
 void equalizer_handle_get_filter_points(DBusConnection *conn, DBusMessage *msg, void *_u) {

@@ -154,6 +154,8 @@ class QPaeq(QtWidgets.QWidget):
 
         self.set_slider_widget(SliderArray(self.filter_state))
 
+        self.layout().addWidget(DampingFilterArray(sink))
+
         self.sink_name=name
         #set the signal listener for this sink
         core=self._get_core()
@@ -293,6 +295,30 @@ class QPaeq(QtWidgets.QWidget):
                 self.profile_box.setCurrentIndex(i)
         self.profile_box.blockSignals(False)
 
+class DampingFilterArray(QtWidgets.QWidget):
+    filter_id = 0
+    def __init__(self,sink,parent=None):
+        super(DampingFilterArray,self).__init__(parent)
+        self.sink=dbus.Interface(sink,dbus_interface=eq_iface)
+        self.setLayout(QtWidgets.QHBoxLayout())
+        self.damping_filters = []
+        self.button=QtWidgets.QPushButton('New Damping', self)
+        self.layout().addWidget(self.button)
+        self.button.clicked.connect(self.button_cb)
+    def add_sub_array(self):
+        DampingFilterArray.filter_id += 1
+        filter_state = DampingFilterState(self.sink,DampingFilterArray.filter_id)
+        damping_filter=SliderArrayDumpSub(filter_state,self)
+        damping_filter.connect_signals()
+        self.damping_filters.append(damping_filter)
+        self.layout().insertWidget(len(self.damping_filters)-1, damping_filter)
+    def removeWidget(self, damping_filter):
+        damping_filter.setParent(None)
+        self.damping_filters.remove(damping_filter)
+    def button_cb(self):
+        self.add_sub_array()
+    
+
 
 class SliderArray(QtWidgets.QWidget):
     def __init__(self,filter_state,parent=None):
@@ -358,6 +384,146 @@ class SliderArray(QtWidgets.QWidget):
         self.set_sub_array(SliderArraySub(self.filter_state))
         self.inhibit_resize-=1
 
+class DampingFilterState(QtCore.QObject):
+    readFilter=QtCore.pyqtSignal()
+    def __init__(self,sink,filter_id):
+        super(DampingFilterState,self).__init__()
+        self.filter_id=filter_id
+        self.freq=120
+        self.ratio=0.8
+        self.resolution=8
+        self.width=8
+        #self.sink_props=dbus.Interface(sink,dbus_interface=prop_iface)
+        self.sink=dbus.Interface(sink,dbus_interface=eq_iface)
+        #self.sample_rate=self.get_eq_attr('SampleRate')
+        #self.filter_rate=self.get_eq_attr('FilterSampleRate')
+        #self.channels=self.get_eq_attr('NChannels')
+        #self.channel=self.channels
+        #self.sync_timer=QtCore.QTimer()
+        #self.sync_timer.setSingleShot(True)
+        #self.sync_timer.timeout.connect(self.save_state)
+
+    def seed(self):
+        self.sink.SeedDampingFilter(self.filter_id,self.freq,self.ratio,self.resolution,self.width)
+        #self.sync_timer.start(SYNC_TIMEOUT)
+    def remove(self):
+        self.sink.RemoveDampingFilter(self.filter_id)
+#    def readback(self):
+#        coefs,preamp=self.sink.FilterAtPoints(self.channel,self.filter_frequencies)
+#        self.coefficients=coefs
+#        self.preamp=preamp
+#        self.readFilter.emit()
+#    def set_filter(self,preamp,coefs):
+#        self.sink.SetFilter(self.channel,dbus.Array(coefs),self.preamp)
+#        self.sync_timer.start(SYNC_TIMEOUT)
+#    def save_state(self):
+#        print('saving state')
+#        self.sink.SaveState()
+#    def load_profile(self,profile):
+#        self.sink.LoadProfile(self.channel,dbus.String(profile))
+#        self.sync_timer.start(SYNC_TIMEOUT)
+#    def flush_state(self):
+#        if self.sync_timer.isActive():
+#            self.sync_timer.stop()
+#            self.save_state()
+
+
+class SliderArrayDumpSub(QtWidgets.QWidget):
+    def __init__(self,filter_state,parent_layout,parent=None):
+        super(SliderArrayDumpSub,self).__init__(parent)
+        self.filter_state=filter_state
+        self.parent_layout=parent_layout
+        self.setLayout(QtWidgets.QGridLayout())
+        qt=QtCore.Qt
+
+        def add_button(button, c):
+            self.layout().addWidget(button,1,c,qt.AlignHCenter)
+            self.layout().setColumnMinimumWidth(c,button.sizeHint().width())
+        def create_button(name):
+            button=QtWidgets.QPushButton(name, self)
+            return button
+        def add_slider(slider,label, c):
+            self.layout().addWidget(slider,0,c,qt.AlignHCenter)
+            self.layout().addWidget(label,1,c,qt.AlignHCenter)
+            self.layout().setColumnMinimumWidth(c,max(label.sizeHint().width(),slider.sizeHint().width()))
+        def create_slider(slider_label,rangeMin, rangeMax):
+            slider=QtWidgets.QSlider(QtCore.Qt.Vertical,self)
+            label=SliderLabel(slider_label,self)
+            slider.setRange(rangeMin,rangeMax)
+            slider.setSingleStep(1)
+            return (slider,label)
+
+        self.freq,self.freq_label=create_slider('freq',40,1400)
+        add_slider(self.freq,self.freq_label,0)
+
+        self.ratio,self.ratio_label=create_slider('ratio',0,100)
+        add_slider(self.ratio,self.ratio_label,1)
+
+        self.resolution,self.resolution_label=create_slider('resolution',8,100)
+        add_slider(self.resolution,self.resolution_label,2)
+
+        self.width,self.width_label=create_slider('width',1,100)
+        add_slider(self.width,self.width_label,3)
+
+        self.del_button=create_button('Del')
+        add_button(self.del_button, 4)
+
+    def connect_signals(self):
+        self.freq.valueChanged.connect(self.write_freq)
+        self.ratio.valueChanged.connect(self.write_ratio)
+        self.resolution.valueChanged.connect(self.write_resolution)
+        self.width.valueChanged.connect(self.write_width)
+        self.del_button.clicked.connect(self.del_button_cb)
+    def disconnect_signals(self):
+        self.freq.valueChanged.disconnect(self.write_freq)
+        self.ratio.valueChanged.disconnect(self.write_ratio)
+        self.resolution.valueChanged.disconnect(self.write_resolution)
+        self.width.valueChanged.disconnect(self.write_width)
+        self.del_button.clicked.disconnect(self.del_button_cb)
+
+    def write_freq(self,v):
+        base=self.resolution.value()
+        v=base*round(v**2/100/base)
+        self.filter_state.freq=v
+        self.filter_state.seed()
+        self.freq_label.refreshText(hz2str(v))
+    def write_ratio(self,v):
+        v=v/100
+        self.filter_state.ratio=v
+        self.filter_state.seed()
+        self.ratio_label.refreshText(str(v))
+    def write_resolution(self,v):
+        self.filter_state.resolution=v
+        self.filter_state.seed()
+        self.resolution_label.refreshText(hz2str(v))
+        self.width.valueChanged.emit(self.width.value())
+        self.freq.valueChanged.emit(self.freq.value())
+    def write_width(self,v):
+        self.filter_state.width=v
+        self.filter_state.seed()
+        self.width_label.refreshText(hz2str(v*self.resolution.value()))
+    def sync_coefficient(self,i):
+        return
+#        slider=self.slider[i]
+#         slider.blockSignals(True)
+#         slider.setValue(self.coef2slider(math.sqrt(2.0)*self.filter_state.coefficients[i]))
+#         slider.blockSignals(False)
+    def del_button_cb(self):
+        self.disconnect_signals()
+        for i in reversed(range(self.layout().count())):
+            self.layout().itemAt(i).widget().setParent(None)
+        self.parent_layout.removeWidget(self)
+        self.filter_state.remove()
+
+    @staticmethod
+    def slider2coef(x):
+        return (1.0+(x/1000.0))
+    @staticmethod
+    def coef2slider(x):
+        return int((x-1.0)*1000)
+outline='border-width: 1px; border-style: solid; border-color: %s;'
+
+
 class SliderArraySub(QtWidgets.QWidget):
     def __init__(self,filter_state,parent=None):
         super(SliderArraySub,self).__init__(parent)
@@ -375,7 +541,7 @@ class SliderArraySub(QtWidgets.QWidget):
             self.layout().setColumnMinimumWidth(c,max(label.sizeHint().width(),slider.sizeHint().width()))
         def create_slider(slider_label):
             slider=QtWidgets.QSlider(QtCore.Qt.Vertical,self)
-            label=SliderLabel(slider_label,filter_state,self)
+            label=SliderLabel(slider_label,self)
             slider.setRange(-1000,2000)
             slider.setSingleStep(1)
             return (slider,label)
@@ -462,7 +628,7 @@ outline='border-width: 1px; border-style: solid; border-color: %s;'
 
 class SliderLabel(QtWidgets.QLabel):
     clicked=QtCore.pyqtSignal()
-    def __init__(self,label_text,filter_state,parent=None):
+    def __init__(self,label_text,parent=None):
         super(SliderLabel,self).__init__(parent)
         self.setStyleSheet('font-family: monospace;')
         self.setText(label_text)
@@ -470,6 +636,9 @@ class SliderLabel(QtWidgets.QLabel):
     def mouseDoubleClickEvent(self, event):
         self.clicked.emit()
         super(SliderLabel,self).mouseDoubleClickEvent(event)
+    def refreshText(self, label_text):
+        self.setText(label_text)
+        self.setMinimumSize(self.sizeHint())
 
 #until there are server side state savings, do it in the client but try and avoid
 #simulaneous broadcasting situations
