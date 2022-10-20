@@ -21,7 +21,7 @@ This is oryqinal pulseaudio equalizer gui:
 Fig. 3
 ![alt text](./oryginal_eq.png)
 
-And here is from this repo:
+And here is from this repo (note new button:
 
 Fig. 4
 ![alt text](./damping_disabled.png)
